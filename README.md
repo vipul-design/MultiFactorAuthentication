@@ -40,10 +40,21 @@ pip install pyotp bcrypt redis fastapi sqlalchemy python-jose
 
 ### 1. Add to your existing `User` model
 
+Add these 3 fields to your existing `User` model (copy-paste as-is):
+
 ```python
-totp_secret: str | None   # Stores TOTP secret (None when MFA not enrolled)
-mfa_enabled: bool         # True once MFA is confirmed and active
+# MFA fields - nullable for existing users until they enroll
+totp_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+mfa_enabled: Mapped[bool] = mapped_column(default=False, nullable=False)
+mfa_skiped: Mapped[bool] = mapped_column(default=False, nullable=False)  # allows skipping MFA prompt
+# End of MFA fields
 ```
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `totp_secret` | `str \| None` | Stores the TOTP secret key. `None` until user enrolls. |
+| `mfa_enabled` | `bool` | `True` only after user completes `/mfa/confirm`. |
+| `mfa_skiped` | `bool` | `True` if the user chose to skip MFA setup (optional feature). |
 
 ### 2. Create a new `RecoveryCode` model
 
@@ -111,20 +122,98 @@ app.include_router(mfa_router, prefix="/auth")
 
 ### Step 3 — Update your login endpoint
 
-When a user logs in with password, check if MFA is enabled. If yes, return a short-lived **pre-auth token** instead of a full access token:
+This is the most important integration step. You need to touch **two places** in your existing login code: the service (business logic) and the router (HTTP response).
+
+---
+
+#### 3a — In your login **service** (where you build the response dict)
+
+Add `mfa_enabled` and `mfa_skiped` to your normal login response:
 
 ```python
-if user.mfa_enabled:
+# Normal login response — add these two fields
+response = {
+    "access_token": access_token,
+    "refresh_token": refresh_token,
+    "token_type": "bearer",
+    "user_with_tenant_exists": user_with_tenant_exists,
+    "tenant_exists": tenant_exists,
+    "tenant_email": tenant_email if tenant_email else None,
+    "requested": has_access_request,
+    "mfa_enabled": False,                                   # ← ADD THIS
+    "mfa_skiped": getattr(user, 'mfa_skiped', False),       # ← ADD THIS
+}
+```
+
+Then, **before building the normal response**, check if MFA is enabled. If it is, return a completely different response — a pre-auth token instead of a full access token:
+
+```python
+if getattr(user, 'mfa_enabled', False):
     pre_auth_token = create_access_token(
         data={"sub": str(user.id), "scope": "mfa_pending"},
         expires_delta=timedelta(minutes=5)
     )
-    return {"pre_auth_token": pre_auth_token, "mfa_required": True}
+    return {
+        "mfa_enabled": True,
+        "pre_auth_token": pre_auth_token,       # ← short-lived token, NOT the full access token
+        "message": "MFA verification required.",
+        "user_with_tenant_exists": user_with_tenant_exists,
+        "tenant_exists": tenant_exists,
+        "tenant_email": tenant_email if tenant_email else None,
+        "requested": has_access_request,
+    }
 
-# else return full token as usual
+# Otherwise fall through and return the normal response dict above
 ```
 
-The client then sends this pre-auth token to `POST /auth/mfa/verify-login`.
+> **Key difference:** When MFA is enabled, you return `pre_auth_token` only — no `access_token`, no `refresh_token`. The full tokens are only issued after `/mfa/verify-login` succeeds.
+
+---
+
+#### 3b — In your login **router** (where you return the HTTP response)
+
+Check the service response and handle the MFA case before building the normal token response:
+
+```python
+# Handle MFA redirect — send pre_auth_token instead of full token
+if response_data.get("mfa_enabled"):
+    return success_response(
+        message=response_data["message"],
+        data={
+            "mfa_enabled": True,
+            "pre_auth_token": response_data["pre_auth_token"],
+            "user_with_tenant_exists": response_data["user_with_tenant_exists"],
+            "tenant_exists": response_data["tenant_exists"],
+            "tenant_email": response_data["tenant_email"],
+            "requested": response_data["requested"],
+        },
+    )
+
+# Normal login — build full token response
+token_data_kwargs = dict(
+    user_with_tenant_exists=response_data["user_with_tenant_exists"],
+    tenant_exists=response_data["tenant_exists"],
+    tenant_email=response_data["tenant_email"],
+    access_token=response_data["access_token"],
+    token_type="bearer",
+    expires_in=3600,
+    requested=response_data["requested"],
+    mfa_enabled=response_data["mfa_enabled"],       # ← always include
+    mfa_skiped=response_data["mfa_skiped"],         # ← always include
+)
+if response_data.get("next"):
+    token_data_kwargs["next"] = response_data["next"]
+
+token_data = TokenData(**token_data_kwargs)
+return success_response(
+    message="Login successful. Use access_token in Authorization header.",
+    data=token_data,
+)
+```
+
+> Make sure your `TokenData` schema includes `mfa_enabled` and `mfa_skiped` fields so the response serializes correctly.
+
+The client then uses the `pre_auth_token` as a Bearer token when calling `POST /auth/mfa/verify-login`.
 
 ### Step 4 — Provide these dependencies
 
@@ -281,12 +370,14 @@ On each failed attempt the counter increments. At 5 failures, a lockout key is s
 ## Integration Checklist
 
 - [ ] Install dependencies: `pyotp bcrypt redis fastapi sqlalchemy python-jose`
-- [ ] Add `totp_secret` and `mfa_enabled` to User model
+- [ ] Add `totp_secret`, `mfa_enabled`, and `mfa_skiped` to User model
 - [ ] Create `RecoveryCode` model and run migrations
 - [ ] Add `TOTP_ISSUER`, `RECOVERY_CODE_COUNT`, and Redis settings to config
 - [ ] Copy all 4 module files into `app/api/auth/mfa/`
 - [ ] Register `mfa_router` in your main FastAPI app
-- [ ] Update login endpoint to return pre-auth token when `mfa_enabled` is True
+- [ ] Update login **service**: add `mfa_enabled` + `mfa_skiped` to normal response; return pre-auth token early if `mfa_enabled` is True
+- [ ] Update login **router**: handle `mfa_enabled` case (return `pre_auth_token`); pass `mfa_enabled` + `mfa_skiped` in normal `TokenData`
+- [ ] Add `mfa_enabled` and `mfa_skiped` fields to your `TokenData` schema
 - [ ] Confirm `get_current_user` and `get_async_db` dependencies exist
 - [ ] Test full flow: enroll → confirm → logout → login → verify-login
 - [ ] Verify recovery codes work and get marked as used after consumption
