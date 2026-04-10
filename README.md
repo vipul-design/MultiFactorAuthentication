@@ -40,13 +40,12 @@ pip install pyotp bcrypt redis fastapi sqlalchemy python-jose
 
 ### 1. Add to your existing `User` model
 
-Add these 3 fields to your existing `User` model (copy-paste as-is):
+Add these 2 fields to your existing `User` model (copy-paste as-is):
 
 ```python
 # MFA fields - nullable for existing users until they enroll
 totp_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
 mfa_enabled: Mapped[bool] = mapped_column(default=False, nullable=False)
-mfa_skiped: Mapped[bool] = mapped_column(default=False, nullable=False)  # allows skipping MFA prompt
 # End of MFA fields
 ```
 
@@ -54,6 +53,17 @@ mfa_skiped: Mapped[bool] = mapped_column(default=False, nullable=False)  # allow
 |-------|------|---------|
 | `totp_secret` | `str \| None` | Stores the TOTP secret key. `None` until user enrolls. |
 | `mfa_enabled` | `bool` | `True` only after user completes `/mfa/confirm`. |
+
+### 1. Add to your existing `Tenant` model
+Add these 1 field to your existing `Tenant` model (copy-paste as-is):
+
+```python
+# MFA field - nullable for existing users until they enroll
+mfa_skiped: Mapped[bool] = mapped_column(default=False, nullable=False)  # allows skipping MFA prompt
+# End of MFA fields
+```
+| Field | Type | Purpose |
+|-------|------|---------|
 | `mfa_skiped` | `bool` | `True` if the user chose to skip MFA setup (optional feature). |
 
 ### 2. Create a new `RecoveryCode` model
@@ -131,7 +141,13 @@ This is the most important integration step. You need to touch **two places** in
 Add `mfa_enabled` and `mfa_skiped` to your normal login response:
 
 ```python
+# Add selecloadin tenant in user table qury to fetch tenant field mfa skipped
+query = await db.execute(
+        select(User).options(selectinload(User.role),selectinload(User.tenant)).where(User.email == email, User.is_deleted == False)
+    )
 # Normal login response — add these two fields
+
+
 response = {
     "access_token": access_token,
     "refresh_token": refresh_token,
@@ -141,7 +157,7 @@ response = {
     "tenant_email": tenant_email if tenant_email else None,
     "requested": has_access_request,
     "mfa_enabled": False,                                   # ← ADD THIS
-    "mfa_skiped": getattr(user, 'mfa_skiped', False),       # ← ADD THIS
+    "mfa_skiped": getattr(user.tenant, 'mfa_skiped', False),       # ← ADD THIS
 }
 ```
 
